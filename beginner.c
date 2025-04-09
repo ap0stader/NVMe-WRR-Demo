@@ -22,7 +22,7 @@ main(int argc, char **argv)
 	opts.opts_size = sizeof(opts);
 	spdk_env_opts_init(&opts);
 
-	opts.name = "nvme_wrr_demo";
+	opts.name = "beginner";
 
 	// Initialize the SPDK environment
 	if (spdk_env_init(&opts) < 0) {
