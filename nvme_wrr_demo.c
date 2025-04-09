@@ -10,7 +10,13 @@ usage(char *program_name)
 	printf("\t[-p io pattern type, must be one of\n");
 	printf("\t\t(read, write, randread, randwrite, rw, randrw)]\n");
 	printf("\t[-M rwmixread (100 for reads, 0 for writes)]\n");
+	printf("\t[-c core mask for I/O submission/completion.]\n");
+	printf("\t\t(cores priority are urgent/high/medium/low in turn)\n");
 	printf("\t[-t time in seconds]\n");
+	printf("\t[-b arbitration burst, default: 7 (unlimited)]\n");
+	printf("\t[-h high priority weight, default: 16]\n");
+	printf("\t[-m medium priority weight, default: 8]\n");
+	printf("\t[-l low priority weight, default: 4]\n");
 }
 
 int main(int argc, char **argv) {
@@ -27,7 +33,7 @@ int main(int argc, char **argv) {
     opts.opts_size = sizeof(opts);
 	spdk_env_opts_init(&opts);
     opts.name = "nvme_wrr_demo";
-    opts.core_mask = CORE_MASK;
+    opts.core_mask = g_arbitration.core_mask;
 
     // Initialize the SPDK environment
 	if (spdk_env_init(&opts) < 0) {
@@ -35,7 +41,22 @@ int main(int argc, char **argv) {
 		return 1;
 	}
 
+    // Get tick rate to convert second into ticks in order to limit the work
+    g_arbitration.tsc_rate = spdk_get_ticks_hz();
+
+    if (register_workers() != 0) {
+		rc = 1;
+		goto exit;
+	}
+	if (register_controllers() != 0) {
+		rc = 1;
+		goto exit;
+	}
+
+	// TODO
+
 exit:
+	cleanup();
     spdk_env_fini();
     if (rc != 0) {
         fprintf(stderr, "%s: errors occurred\n", argv[0]);
@@ -51,12 +72,14 @@ parse_args(int argc, char **argv)
 	const char *io_pattern_type = NULL;
 	bool mix_specified = false;
 
-	while ((op = getopt(argc, argv, "d:p:s:t:M:")) != -1) {
+	while ((op = getopt(argc, argv, "b:c:d:h:l:m:p:s:t:M:")) != -1) {
 		switch (op) {
+		case 'c':
+			g_arbitration.core_mask = optarg;
+			break;
 		case 'p':
 			g_arbitration.io_pattern_type = optarg;
 			break;
-        case 'h':
         case '?':
             usage(argv[0]);
             return 1;
@@ -79,6 +102,18 @@ parse_args(int argc, char **argv)
 				break;
             case 't':
 				g_arbitration.time_in_sec = val;
+				break;
+			case 'b':
+				g_arbitration.arbitration_burst = val;
+				break;
+			case 'h':
+				g_arbitration.high_priority_weight = val - 1;
+				break;
+			case 'm':
+				g_arbitration.medium_priority_weight = val - 1;
+				break;
+			case 'l':
+				g_arbitration.low_priority_weight = val - 1;
 				break;
 			default:
 				usage(argv[0]);
@@ -134,5 +169,320 @@ parse_args(int argc, char **argv)
 		}
 	}
 
+	if (g_arbitration.arbitration_burst >= 7) {
+		printf("The arbitration burst is set to bigger than 7 which means unlimited\n");
+	}
+
+	if (g_arbitration.high_priority_weight >= 255 ||
+		g_arbitration.medium_priority_weight >= 255 ||
+		g_arbitration.low_priority_weight >= 255) {
+		fprintf(stderr,
+			"High/medium/low priority weight must be specified to value from 1 to 256.\n");
+		return 1;
+	}
+
 	return 0;
+}
+
+static int
+register_workers(void)
+{
+	uint32_t i;
+	struct worker_thread *worker;
+	enum spdk_nvme_qprio qprio = SPDK_NVME_QPRIO_URGENT;
+
+	// The environment is initialized with core_mask at main function
+	SPDK_ENV_FOREACH_CORE(i) {
+		worker = calloc(1, sizeof(*worker));
+		if (worker == NULL) {
+			fprintf(stderr, "Unable to allocate worker\n");
+			return -1;
+		}
+		printf("Allocated worker for %d\n", i);
+
+		TAILQ_INIT(&worker->ns_ctx);
+		worker->lcore = i;
+		qprio++;
+		// Mask for more than four cores
+		worker->qprio = qprio & SPDK_NVME_CREATE_IO_SQ_QPRIO_MASK;
+		
+		TAILQ_INSERT_TAIL(&g_workers, worker, link);
+		g_arbitration.num_workers++;
+	}
+
+	return 0;
+}
+
+static int
+register_controllers(void)
+{
+	printf("Initializing NVMe Controllers\n");
+
+	if (spdk_nvme_probe(&g_trid, NULL, probe_cb, attach_cb, NULL) != 0) {
+		fprintf(stderr, "spdk_nvme_probe() failed\n");
+		return 1;
+	}
+
+	if (g_arbitration.num_namespaces == 0) {
+		fprintf(stderr, "No valid namespaces to continue IO testing\n");
+		return 1;
+	}
+
+	return 0;
+}
+
+static bool
+probe_cb(void *cb_ctx, const struct spdk_nvme_transport_id *trid,
+	 struct spdk_nvme_ctrlr_opts *opts)
+{
+	// Update arbitration configuration, forced to use WRR
+	opts->arb_mechanism = SPDK_NVME_CC_AMS_WRR;
+	printf("Attaching to %s\n", trid->traddr);
+	return true;
+}
+
+static void
+attach_cb(void *cb_ctx, const struct spdk_nvme_transport_id *trid,
+	  struct spdk_nvme_ctrlr *ctrlr, const struct spdk_nvme_ctrlr_opts *opts)
+{
+	printf("Attached to %s\n", trid->traddr);
+	// Update with actual arbitration configuration
+	printf("  Weighted Round Robin: %s", opts->arb_mechanism == SPDK_NVME_CC_AMS_WRR ?
+	       "Supported" : "Not Supported");
+	register_ctrlr(ctrlr, opts);
+}
+
+static void
+register_ctrlr(struct spdk_nvme_ctrlr *ctrlr, const struct spdk_nvme_ctrlr_opts *opts)
+{
+	struct ctrlr_entry *entry;
+	const struct spdk_nvme_ctrlr_data *cdata;
+
+	uint32_t nsid;
+	struct spdk_nvme_ns *ns;
+
+	union spdk_nvme_cap_register cap;
+
+	entry = calloc(1, sizeof(struct ctrlr_entry));
+	if (entry == NULL) {
+		perror("ctrlr_entry malloc");
+		exit(1);
+	}
+
+	cdata = spdk_nvme_ctrlr_get_data(ctrlr);
+	snprintf(entry->name, sizeof(entry->name), "%-20.20s (%-20.20s)", cdata->mn, cdata->sn);
+	printf("  Name: %s\n", entry->name);
+
+	entry->ctrlr = ctrlr;
+	TAILQ_INSERT_TAIL(&g_controllers, entry, link);
+
+	for (nsid = spdk_nvme_ctrlr_get_first_active_ns(ctrlr); nsid != 0;
+			nsid = spdk_nvme_ctrlr_get_next_active_ns(ctrlr, nsid)) {
+		ns = spdk_nvme_ctrlr_get_ns(ctrlr, nsid);
+		if (ns == NULL) {
+			continue;
+		}
+		register_ns(ctrlr, ns);
+	}
+
+	// Setup weighted round robin
+	cap = spdk_nvme_ctrlr_get_regs_cap(ctrlr);
+	if (opts->arb_mechanism == SPDK_NVME_CC_AMS_WRR && (cap.bits.ams & SPDK_NVME_CAP_AMS_WRR)) {
+		print_arb_feature(ctrlr);
+		set_arb_feature(ctrlr);
+		print_arb_feature(ctrlr);	
+	}
+}
+
+static void
+register_ns(struct spdk_nvme_ctrlr *ctrlr, struct spdk_nvme_ns *ns)
+{
+	struct ns_entry *entry;
+	const struct spdk_nvme_ctrlr_data *cdata;
+
+	if (!spdk_nvme_ns_is_active(ns)) {
+		return;
+	}
+
+	// Judge if IO size is valid
+	cdata = spdk_nvme_ctrlr_get_data(ctrlr);
+	// IO size is invalid can because of
+	// 1. Namespace size is too small
+	// 2. Sector size is too smal
+	// 3. IO size is not multiple of Sector size 
+	if (spdk_nvme_ns_get_size(ns) < g_arbitration.io_size_bytes ||
+	    spdk_nvme_ns_get_extended_sector_size(ns) > g_arbitration.io_size_bytes ||
+	    g_arbitration.io_size_bytes % spdk_nvme_ns_get_extended_sector_size(ns)) {
+		printf("WARNING: controller %-20.20s (%-20.20s) ns %u has invalid "
+		       "ns size %" PRIu64 " / block size %u for I/O size %u\n",
+		       cdata->mn, cdata->sn, spdk_nvme_ns_get_id(ns),
+		       spdk_nvme_ns_get_size(ns), spdk_nvme_ns_get_extended_sector_size(ns),
+		       g_arbitration.io_size_bytes);
+		return;
+	}
+
+	entry = malloc(sizeof(struct ns_entry));
+	if (entry == NULL) {
+		perror("ns_entry malloc");
+		exit(1);
+	}
+
+	entry->nvme.ctrlr = ctrlr;
+	entry->nvme.ns = ns;
+	entry->size_in_ios = spdk_nvme_ns_get_size(ns) / g_arbitration.io_size_bytes;
+	entry->io_size_blocks = g_arbitration.io_size_bytes / spdk_nvme_ns_get_sector_size(ns);
+	snprintf(entry->name, 44, "%-20.20s (%-20.20s)", cdata->mn, cdata->sn);
+	TAILQ_INSERT_TAIL(&g_namespaces, entry, link);
+	g_arbitration.num_namespaces++;
+}
+
+static void
+print_arb_feature(struct spdk_nvme_ctrlr *ctrlr)
+{
+	get_feature(ctrlr, SPDK_NVME_FEAT_ARBITRATION);
+
+	// Get feature is asynchronized. Polling is needed
+	g_outstanding_commands++;
+	while (g_outstanding_commands) {
+		spdk_nvme_ctrlr_process_admin_completions(ctrlr);
+	}
+
+	if (features[SPDK_NVME_FEAT_ARBITRATION].valid) {
+		// SPDK designed serveral unions to decode the result automatically
+		union spdk_nvme_cmd_cdw11 arb;
+		arb.feat_arbitration.raw = features[SPDK_NVME_FEAT_ARBITRATION].result;
+
+		printf("Current Arbitration Configuration\n");
+		printf("===========\n");
+		printf("Arbitration Burst:           ");
+		if (arb.feat_arbitration.bits.ab == SPDK_NVME_ARBITRATION_BURST_UNLIMITED) {
+			printf("no limit\n");
+		} else {
+			printf("%u\n", 1u << arb.feat_arbitration.bits.ab);
+		}
+		printf("Low Priority Weight:         %u\n", arb.feat_arbitration.bits.lpw + 1);
+		printf("Medium Priority Weight:      %u\n", arb.feat_arbitration.bits.mpw + 1);
+		printf("High Priority Weight:        %u\n", arb.feat_arbitration.bits.hpw + 1);
+		printf("\n");
+	}
+}
+
+static int
+get_feature(struct spdk_nvme_ctrlr *ctrlr, uint8_t fid)
+{
+	struct spdk_nvme_cmd cmd = {};
+	struct feature *feature = &features[fid];
+
+	feature->valid = false;
+
+	cmd.opc = SPDK_NVME_OPC_GET_FEATURES;
+	cmd.cdw10_bits.get_features.fid = fid;
+
+	return spdk_nvme_ctrlr_cmd_admin_raw(ctrlr, &cmd, NULL, 0, get_feature_completion, feature);
+}
+
+static void
+get_feature_completion(void *cb_arg, const struct spdk_nvme_cpl *cpl)
+{
+	struct feature *feature = cb_arg;
+	int fid = feature - features;
+
+	if (spdk_nvme_cpl_is_error(cpl)) {
+		printf("get_feature(0x%02X) failed\n", fid);
+	} else {
+		feature->result = cpl->cdw0;
+		feature->valid = true;
+	}
+
+	g_outstanding_commands--;
+}
+
+static int
+set_arb_feature(struct spdk_nvme_ctrlr *ctrlr)
+{
+	int rc;
+	struct spdk_nvme_cmd cmd = {};
+
+	cmd.opc = SPDK_NVME_OPC_SET_FEATURES;
+	cmd.cdw10_bits.set_features.fid = SPDK_NVME_FEAT_ARBITRATION;
+
+	cmd.cdw11_bits.feat_arbitration.bits.ab = g_arbitration.arbitration_burst;
+	cmd.cdw11_bits.feat_arbitration.bits.hpw = g_arbitration.high_priority_weight;
+	cmd.cdw11_bits.feat_arbitration.bits.mpw = g_arbitration.medium_priority_weight;
+	cmd.cdw11_bits.feat_arbitration.bits.lpw = g_arbitration.low_priority_weight;
+
+	rc = spdk_nvme_ctrlr_cmd_admin_raw(ctrlr, &cmd, NULL, 0,
+					    set_feature_completion, &features[SPDK_NVME_FEAT_ARBITRATION]);
+	if (rc) {
+		printf("Set Arbitration Feature: Failed 0x%x\n", rc);
+		return 1;
+	}
+
+	// Polling is also needed
+	g_outstanding_commands++;
+	while (g_outstanding_commands) {
+		spdk_nvme_ctrlr_process_admin_completions(ctrlr);
+	}
+
+	if (!features[SPDK_NVME_FEAT_ARBITRATION].valid) {
+		printf("Set Arbitration Feature failed and use default configuration\n");
+	}
+	return 0;
+}
+
+static void
+set_feature_completion(void *cb_arg, const struct spdk_nvme_cpl *cpl)
+{
+	struct feature *feature = cb_arg;
+	// Use the offset of pointer to calculate fid
+	int fid = feature - features;
+
+	if (spdk_nvme_cpl_is_error(cpl)) {
+		printf("set_feature(0x%02X) failed\n", fid);
+		feature->valid = false;
+	} else {
+		printf("Set Arbitration Feature Successfully\n\n");
+	}
+
+	g_outstanding_commands--;
+}
+
+
+
+// TODO be complete
+static void
+cleanup(void)
+{
+	struct ns_entry *ns_entry, *tmp_ns_entry;
+	struct worker_thread *worker, *tmp_worker;
+	struct ns_worker_ctx *ns_ctx, *tmp_ns_ctx;
+	struct ctrlr_entry *ctrlr_entry, *tmp_ctrlr_entry;
+	struct spdk_nvme_detach_ctx *detach_ctx = NULL;
+
+	TAILQ_FOREACH_SAFE(ns_entry, &g_namespaces, link, tmp_ns_entry) {
+		TAILQ_REMOVE(&g_namespaces, ns_entry, link);
+		free(ns_entry);
+	};
+
+	TAILQ_FOREACH_SAFE(worker, &g_workers, link, tmp_worker) {
+		TAILQ_REMOVE(&g_workers, worker, link);
+
+		/* ns_worker_ctx is a list in the worker */
+		TAILQ_FOREACH_SAFE(ns_ctx, &worker->ns_ctx, link, tmp_ns_ctx) {
+			TAILQ_REMOVE(&worker->ns_ctx, ns_ctx, link);
+			free(ns_ctx);
+		}
+
+		free(worker);
+	};
+
+	TAILQ_FOREACH_SAFE(ctrlr_entry, &g_controllers, link, tmp_ctrlr_entry) {
+		TAILQ_REMOVE(&g_controllers, ctrlr_entry, link);
+		spdk_nvme_detach_async(ctrlr_entry->ctrlr, &detach_ctx);
+		free(ctrlr_entry);
+	}
+
+	if (detach_ctx) {
+		spdk_nvme_detach_poll(detach_ctx);
+	}
 }

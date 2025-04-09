@@ -132,12 +132,13 @@ attach_cb(void *cb_ctx, const struct spdk_nvme_transport_id *trid,
 	int nsid;
 	struct spdk_nvme_ns *ns;
 	
+	printf("Attached to %s ", trid->traddr);
+
 	entry = malloc(sizeof(struct ctrlr_entry));
 	if (entry == NULL) {
 		perror("ctrlr_entry malloc");
 		exit(1);
 	}
-	printf("Attached to %s ", trid->traddr);
 
 	// Use an NVMe admin command to read detailed information on the controller
 	// Specification 5.15.2.2 Identify Controller data structure

@@ -6,27 +6,51 @@
 static struct spdk_nvme_transport_id g_trid = {};
 
 struct arb_context {
-	// Specify by option
+	// Specify by options
+	const char		*core_mask;
 	int				io_queue_depth;
 	uint32_t		io_size_bytes;
 	const char		*io_pattern_type;
 	int				is_random;
 	int				rw_percentage;
 	int				time_in_sec;
+	uint32_t		arbitration_burst;
+	uint32_t		high_priority_weight;
+	uint32_t		medium_priority_weight;
+	uint32_t		low_priority_weight;
+	// Get by using SPDK
+	uint64_t		tsc_rate;
+	// Other
+	int				num_workers;
+	int				num_namespaces;
 };
 
 static struct arb_context g_arbitration = {
 	// Default value
+	// cores 0-3 for urgent/high/medium/low
+	.core_mask					= "0xf",
 	.io_queue_depth				= 64,
 	.io_size_bytes				= 131072,
 	.io_pattern_type			= "randrw",
 	.is_random					= 1,
 	.rw_percentage				= 50,
 	.time_in_sec				= 20,
+	.arbitration_burst			= 0x7,
+	.high_priority_weight		= 16,
+	.medium_priority_weight		= 8,
+	.low_priority_weight		= 4,
+	// Initial value
+	.num_workers				= 0,
+	.num_namespaces				= 0,
 };
 
-// cores 0-3 for urgent/high/medium/low
-#define CORE_MASK "0xf"
+// Use to store the features fetched from controller
+struct feature {
+	uint32_t				result;
+	bool					valid;
+};
+
+static struct feature features[SPDK_NVME_FEAT_ARBITRATION + 1] = {};
 
 struct ctrlr_entry {
 	struct spdk_nvme_ctrlr		*ctrlr;
@@ -43,21 +67,79 @@ struct ns_entry {
 	} nvme;
 
 	TAILQ_ENTRY(ns_entry)		link;
-	uint32_t				    io_size_blocks;
+	// How many IO of io size can be performed
 	uint64_t				    size_in_ios;
+	// how many blocks of io size
+	uint32_t				    io_size_blocks;
 	char					    name[1024];
 };
 
 static TAILQ_HEAD(, ns_entry) g_namespaces = TAILQ_HEAD_INITIALIZER(g_namespaces);
 
+struct ns_worker_ctx {
+	struct ns_entry				*entry;
+	uint64_t					io_completed;
+	uint64_t					current_queue_depth;
+	uint64_t					offset_in_ios;
+	bool						is_draining;
+	struct spdk_nvme_qpair		*qpair;
+	TAILQ_ENTRY(ns_worker_ctx)	link;
+};
+
 struct worker_thread {
 	TAILQ_HEAD(, ns_worker_ctx)		ns_ctx;
 	TAILQ_ENTRY(worker_thread)		link;
+	// Logical core
 	unsigned						lcore;
 	enum spdk_nvme_qprio			qprio;
 };
 
 static TAILQ_HEAD(, worker_thread) g_workers = TAILQ_HEAD_INITIALIZER(g_workers);
 
+// outstanding == problems have not yet been resolved
+int	g_outstanding_commands = 0;
+
+
 static int
 parse_args(int argc, char **argv);
+
+static int
+register_workers(void);
+
+static int
+register_controllers(void);
+
+static bool
+probe_cb(void *cb_ctx, const struct spdk_nvme_transport_id *trid,
+	  struct spdk_nvme_ctrlr_opts *opts);
+
+static void
+attach_cb(void *cb_ctx, const struct spdk_nvme_transport_id *trid,
+	  struct spdk_nvme_ctrlr *ctrlr, const struct spdk_nvme_ctrlr_opts *opts);
+
+static void
+register_ctrlr(struct spdk_nvme_ctrlr *ctrlr, const struct spdk_nvme_ctrlr_opts *opts);
+
+static void
+register_ns(struct spdk_nvme_ctrlr *ctrlr, struct spdk_nvme_ns *ns);
+
+static void
+print_arb_feature(struct spdk_nvme_ctrlr *ctrlr);
+
+static int
+get_feature(struct spdk_nvme_ctrlr *ctrlr, uint8_t fid);
+
+static void
+get_feature_completion(void *cb_arg, const struct spdk_nvme_cpl *cpl);
+
+static int
+set_arb_feature(struct spdk_nvme_ctrlr *ctrlr);
+
+static void
+set_feature_completion(void *cb_arg, const struct spdk_nvme_cpl *cpl);
+
+
+
+
+static void
+cleanup(void);
