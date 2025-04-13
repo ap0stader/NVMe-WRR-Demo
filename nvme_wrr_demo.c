@@ -20,8 +20,8 @@ usage(char *program_name)
 }
 
 int main(int argc, char **argv) {
-    int rc;
-    struct spdk_env_opts opts;
+	int rc;
+	struct spdk_env_opts opts;
 
 	char task_pool_name[30];
 	uint32_t task_count = 0;
@@ -29,26 +29,26 @@ int main(int argc, char **argv) {
 	uint32_t main_core;
 	struct worker_thread *worker, *main_worker;
 
-    rc = parse_args(argc, argv);
+	rc = parse_args(argc, argv);
 	if (rc != 0) {
 		return rc;
 	}
-    
-    opts.opts_size = sizeof(opts);
+	
+	opts.opts_size = sizeof(opts);
 	spdk_env_opts_init(&opts);
-    opts.name = "nvme_wrr_demo";
-    opts.core_mask = g_arbitration.core_mask;
+	opts.name = "nvme_wrr_demo";
+	opts.core_mask = g_arbitration.core_mask;
 
-    // Initialize the SPDK environment
+	// Initialize the SPDK environment
 	if (spdk_env_init(&opts) < 0) {
 		fprintf(stderr, "Unable to initialize SPDK env\n");
 		return 1;
 	}
 
-    // Get tick rate to convert second into ticks in order to limit the work
-    g_arbitration.tsc_rate = spdk_get_ticks_hz();
+	// Get tick rate to convert second into ticks in order to limit the work
+	g_arbitration.tsc_rate = spdk_get_ticks_hz();
 
-    if (register_workers() != 0) {
+	if (register_workers() != 0) {
 		rc = 1;
 		goto exit;
 	}
@@ -61,7 +61,7 @@ int main(int argc, char **argv) {
 		goto exit;
 	}
 
-	// Create a task pool
+	// Create a thread-safe task pool
 	snprintf(task_pool_name, sizeof(task_pool_name), "task_pool_%d", getpid());
 	task_count = g_arbitration.num_namespaces > g_arbitration.num_workers ?
 				 g_arbitration.num_namespaces : g_arbitration.num_workers;
@@ -101,11 +101,11 @@ int main(int argc, char **argv) {
 
 exit:
 	cleanup(task_count);
-    spdk_env_fini();
-    if (rc != 0) {
-        fprintf(stderr, "%s: errors occurred\n", argv[0]);
-    }
-    return rc;
+	spdk_env_fini();
+	if (rc != 0) {
+		fprintf(stderr, "%s: errors occurred\n", argv[0]);
+	}
+	return rc;
 }
 
 static int
@@ -113,6 +113,8 @@ worker_fn(void *arg)
 {	
 	struct worker_thread *worker = (struct worker_thread *)arg;
 	struct worker_ns_ctx *ns_ctx;
+
+	uint64_t tsc_end;
 
 	printf("Starting thread on core %u with %s\n", worker->lcore, print_qprio(worker->qprio));
 
@@ -124,7 +126,30 @@ worker_fn(void *arg)
 		}
 	}
 
+	// Calculate the end time of the thread
+	tsc_end = spdk_get_ticks() + g_arbitration.time_in_sec * g_arbitration.tsc_rate;
+
+	// Submit initial I/O for each namespace.
 	TAILQ_FOREACH(ns_ctx, &worker->ns_ctx, link) {
+		submit_init_ios(ns_ctx, g_arbitration.io_queue_depth);
+	}
+
+	// Polling
+	while (1) {
+		// Check for completed I/O for each controller.
+		// A new I/O will be submitted in the task_complete() callback to replace each I/O that is completed.
+
+		TAILQ_FOREACH(ns_ctx, &worker->ns_ctx, link) {
+			spdk_nvme_qpair_process_completions(ns_ctx->qpair, 0);
+		}
+
+		if (spdk_get_ticks() > tsc_end) {
+			break;
+		}
+	}
+
+	TAILQ_FOREACH(ns_ctx, &worker->ns_ctx, link) {
+		drain_io(ns_ctx);
 		// Free the queue pair for each namespace of this worker
 		cleanup_ns_worker_ctx(ns_ctx);
 	}
@@ -135,8 +160,8 @@ worker_fn(void *arg)
 static int
 parse_args(int argc, char **argv)
 {
-    int op;
-    long int val;
+	int op;
+	long int val;
 	const char *io_pattern_type = NULL;
 	bool mix_specified = false;
 
@@ -148,9 +173,9 @@ parse_args(int argc, char **argv)
 		case 'p':
 			g_arbitration.io_pattern_type = optarg;
 			break;
-        case '?':
-            usage(argv[0]);
-            return 1;
+		case '?':
+			usage(argv[0]);
+			return 1;
 		default:
 			val = spdk_strtol(optarg, 10);
 			if (val < 0) {
@@ -158,17 +183,17 @@ parse_args(int argc, char **argv)
 				return val;
 			}
 			switch (op) {
-            case 'd':
+			case 'd':
 				g_arbitration.io_queue_depth = val;
 				break;
 			case 's':
 				g_arbitration.io_size_bytes = val;
 				break;
-            case 'M':
+			case 'M':
 				g_arbitration.rw_percentage = val;
 				mix_specified = true;
 				break;
-            case 't':
+			case 't':
 				g_arbitration.time_in_sec = val;
 				break;
 			case 'b':
@@ -193,43 +218,43 @@ parse_args(int argc, char **argv)
 	io_pattern_type = g_arbitration.io_pattern_type;
 
 	if (strcmp(io_pattern_type, "read") &&
-	    strcmp(io_pattern_type, "write") &&
-	    strcmp(io_pattern_type, "randread") &&
-	    strcmp(io_pattern_type, "randwrite") &&
-	    strcmp(io_pattern_type, "rw") &&
-	    strcmp(io_pattern_type, "randrw")) {
+		strcmp(io_pattern_type, "write") &&
+		strcmp(io_pattern_type, "randread") &&
+		strcmp(io_pattern_type, "randwrite") &&
+		strcmp(io_pattern_type, "rw") &&
+		strcmp(io_pattern_type, "randrw")) {
 		fprintf(stderr,
 			"io pattern type must be one of\n"
 			"(read, write, randread, randwrite, rw, randrw)\n");
 		return 1;
 	}
-    if (!strcmp(io_pattern_type, "read") ||
-        !strcmp(io_pattern_type, "write") ||
-        !strcmp(io_pattern_type, "rw")) {
-        g_arbitration.is_random = 0;
-    } else {
-        g_arbitration.is_random = 1;
-    }
-
-    if (!strcmp(io_pattern_type, "read") ||
-        !strcmp(io_pattern_type, "randread") ||
-        !strcmp(io_pattern_type, "write") ||
-        !strcmp(io_pattern_type, "randwrite")) {
-        if (mix_specified) {
-            fprintf(stderr, "Ignoring -M option because io pattern type"
-                " is not rw or randrw.\n");
-        }
-    }
 	if (!strcmp(io_pattern_type, "read") ||
-	    !strcmp(io_pattern_type, "randread")) {
+		!strcmp(io_pattern_type, "write") ||
+		!strcmp(io_pattern_type, "rw")) {
+		g_arbitration.is_random = 0;
+	} else {
+		g_arbitration.is_random = 1;
+	}
+
+	if (!strcmp(io_pattern_type, "read") ||
+		!strcmp(io_pattern_type, "randread") ||
+		!strcmp(io_pattern_type, "write") ||
+		!strcmp(io_pattern_type, "randwrite")) {
+		if (mix_specified) {
+			fprintf(stderr, "Ignoring -M option because io pattern type"
+				" is not rw or randrw.\n");
+		}
+	}
+	if (!strcmp(io_pattern_type, "read") ||
+		!strcmp(io_pattern_type, "randread")) {
 		g_arbitration.rw_percentage = 100;
 	}
 	if (!strcmp(io_pattern_type, "write") ||
-	    !strcmp(io_pattern_type, "randwrite")) {
+		!strcmp(io_pattern_type, "randwrite")) {
 		g_arbitration.rw_percentage = 0;
 	}
 	if (!strcmp(io_pattern_type, "rw") ||
-	    !strcmp(io_pattern_type, "randrw")) {
+		!strcmp(io_pattern_type, "randrw")) {
 		if (g_arbitration.rw_percentage < 0 || g_arbitration.rw_percentage > 100) {
 			fprintf(stderr,
 				"-M must be specified to value from 0 to 100 or rw or randrw.\n");
@@ -316,7 +341,7 @@ attach_cb(void *cb_ctx, const struct spdk_nvme_transport_id *trid,
 	printf("Attached to %s\n", trid->traddr);
 	// Update with actual arbitration configuration
 	printf("  Weighted Round Robin: %s\n", opts->arb_mechanism == SPDK_NVME_CC_AMS_WRR ?
-	       "Supported" : "Not Supported");
+		   "Supported" : "Not Supported");
 	register_ctrlr(ctrlr, opts);
 }
 
@@ -379,13 +404,13 @@ register_ns(struct spdk_nvme_ctrlr *ctrlr, struct spdk_nvme_ns *ns)
 	// 2. IO size is smaller than sectoer size
 	// 3. IO size is not a multiple of sector size 
 	if (spdk_nvme_ns_get_size(ns) < g_arbitration.io_size_bytes ||
-	    spdk_nvme_ns_get_extended_sector_size(ns) > g_arbitration.io_size_bytes ||
-	    g_arbitration.io_size_bytes % spdk_nvme_ns_get_extended_sector_size(ns)) {
+		spdk_nvme_ns_get_extended_sector_size(ns) > g_arbitration.io_size_bytes ||
+		g_arbitration.io_size_bytes % spdk_nvme_ns_get_extended_sector_size(ns)) {
 		printf("WARNING: controller %-20.20s (%-20.20s) ns %u has invalid "
-		       "ns size %" PRIu64 " / block size %u for I/O size %u\n",
-		       cdata->mn, cdata->sn, spdk_nvme_ns_get_id(ns),
-		       spdk_nvme_ns_get_size(ns), spdk_nvme_ns_get_extended_sector_size(ns),
-		       g_arbitration.io_size_bytes);
+			   "ns size %" PRIu64 " / block size %u for I/O size %u\n",
+			   cdata->mn, cdata->sn, spdk_nvme_ns_get_id(ns),
+			   spdk_nvme_ns_get_size(ns), spdk_nvme_ns_get_extended_sector_size(ns),
+			   g_arbitration.io_size_bytes);
 		return;
 	}
 
@@ -436,15 +461,15 @@ print_arb_feature(struct spdk_nvme_ctrlr *ctrlr)
 
 		printf("Current Arbitration Configuration\n");
 		printf("===========\n");
-		printf("Arbitration Burst:           ");
+		printf("Arbitration Burst:		   ");
 		if (arb.feat_arbitration.bits.ab == SPDK_NVME_ARBITRATION_BURST_UNLIMITED) {
 			printf("no limit\n");
 		} else {
 			printf("%u\n", 1u << arb.feat_arbitration.bits.ab);
 		}
-		printf("Low Priority Weight:         %u\n", arb.feat_arbitration.bits.lpw + 1);
-		printf("Medium Priority Weight:      %u\n", arb.feat_arbitration.bits.mpw + 1);
-		printf("High Priority Weight:        %u\n", arb.feat_arbitration.bits.hpw + 1);
+		printf("Low Priority Weight:		 %u\n", arb.feat_arbitration.bits.lpw + 1);
+		printf("Medium Priority Weight:	  %u\n", arb.feat_arbitration.bits.mpw + 1);
+		printf("High Priority Weight:		%u\n", arb.feat_arbitration.bits.hpw + 1);
 		printf("\n");
 	} else {
 		printf("Set Arbitration Feature failed\n");
@@ -485,7 +510,7 @@ set_arb_feature(struct spdk_nvme_ctrlr *ctrlr)
 	cmd.cdw11_bits.feat_arbitration.bits.lpw = g_arbitration.low_priority_weight;
 
 	rc = spdk_nvme_ctrlr_cmd_admin_raw(ctrlr, &cmd, NULL, 0,
-					    set_feature_completion, &g_features[SPDK_NVME_FEAT_ARBITRATION]);
+						set_feature_completion, &g_features[SPDK_NVME_FEAT_ARBITRATION]);
 	if (rc) {
 		printf("Set Arbitration Feature: Failed 0x%x\n", rc);
 		return;
@@ -577,6 +602,98 @@ init_worker_ns_ctx(struct worker_ns_ctx *ns_ctx, enum spdk_nvme_qprio qprio)
 	}
 
 	return 0;
+}
+
+static void
+submit_init_ios(struct worker_ns_ctx *ns_ctx, int queue_depth)
+{
+	while (queue_depth-- > 0) {
+		submit_single_io(ns_ctx);
+	}
+}
+
+static __thread unsigned int seed = 0;
+
+static void
+submit_single_io(struct worker_ns_ctx *ns_ctx)
+{
+	int rc;
+	struct arb_task	*task = NULL;
+	struct ns_entry	*ns_entry = ns_ctx->ns_entry;
+	uint64_t offset_in_ios;
+
+	// Get a task from task pool
+	task = spdk_mempool_get(g_task_pool);
+	if (!task) {
+		fprintf(stderr, "Failed to get task from task_pool\n");
+		exit(1);
+	}
+
+	// Allocate a space for DMA
+	task->buf = spdk_dma_zmalloc(g_arbitration.io_size_bytes, 0x200, NULL);
+	if (!task->buf) {
+		spdk_mempool_put(g_task_pool, task);
+		fprintf(stderr, "task->buf spdk_dma_zmalloc failed\n");
+		exit(1);
+	}
+	task->ns_ctx = ns_ctx;
+
+	if (g_arbitration.is_random) {
+		// rand_r() is a thread-safe version random number generator
+		// number range is [0, RAND_MAX] (RAND_MAX == 2147483647 on this machine)
+		offset_in_ios = rand_r(&seed) % ns_entry->size_in_ios;
+	} else {
+		offset_in_ios = ns_ctx->offset_in_ios++;
+		if (ns_ctx->offset_in_ios == ns_entry->size_in_ios) {
+			ns_ctx->offset_in_ios = 0;
+		}
+	}
+
+	if ((g_arbitration.rw_percentage == 100) ||
+		(g_arbitration.rw_percentage != 0 &&
+		 ((rand_r(&seed) % 100) < g_arbitration.rw_percentage))) {
+		rc = spdk_nvme_ns_cmd_read(ns_entry->nvme.ns, ns_ctx->qpair, task->buf,
+						offset_in_ios * ns_entry->io_size_blocks,
+						ns_entry->io_size_blocks, task_complete, task, 0);
+	} else {
+		rc = spdk_nvme_ns_cmd_write(ns_entry->nvme.ns, ns_ctx->qpair, task->buf,
+						offset_in_ios * ns_entry->io_size_blocks,
+						ns_entry->io_size_blocks, task_complete, task, 0);
+	}
+
+	if (rc != 0) {
+		fprintf(stderr, "starting I/O failed\n");
+	} else {
+		ns_ctx->current_queue_depth++;
+	}
+}
+
+static void
+task_complete(void *ctx, const struct spdk_nvme_cpl *completion)
+{
+	struct arb_task *task = (struct arb_task *)ctx;
+	struct worker_ns_ctx *ns_ctx = task->ns_ctx;
+
+	ns_ctx->current_queue_depth--;
+	ns_ctx->io_completed++;
+
+	spdk_dma_free(task->buf);
+	spdk_mempool_put(g_task_pool, task);
+
+	// is_draining indicates when time has expired for the test run
+	// If is_draining is true, only waits for the previously submitted I/O to complete.
+	if (!ns_ctx->is_draining) {
+		submit_single_io(ns_ctx);
+	}
+}
+
+static void
+drain_io(struct worker_ns_ctx *ns_ctx)
+{
+	ns_ctx->is_draining = true;
+	while (ns_ctx->current_queue_depth > 0) {
+		spdk_nvme_qpair_process_completions(ns_ctx->qpair, 0);
+	}
 }
 
 // TODO

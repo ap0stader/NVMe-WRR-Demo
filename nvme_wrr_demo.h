@@ -69,11 +69,12 @@ struct ns_entry {
 	} nvme;
 
 	TAILQ_ENTRY(ns_entry)		link;
+	char					    name[1024];
+	// For calculating the io command address
 	// The size of namespace in io size
 	uint64_t				    size_in_ios;
 	// The amount of blocks of io size
 	uint32_t				    io_size_blocks;
-	char					    name[1024];
 };
 
 static TAILQ_HEAD(, ns_entry) g_namespaces = TAILQ_HEAD_INITIALIZER(g_namespaces);
@@ -82,10 +83,13 @@ struct worker_ns_ctx {
 	struct ns_entry				*ns_entry;
 	TAILQ_ENTRY(worker_ns_ctx)	link;
 	struct spdk_nvme_qpair		*qpair;
-	uint64_t					current_queue_depth;
-	uint64_t					io_completed;
+	// For sequential access
 	uint64_t					offset_in_ios;
+	// For judge if all the io commands are completed
+	uint64_t					current_queue_depth;
 	bool						is_draining;
+	// Use for statistics
+	uint64_t					io_completed;
 };
 
 struct worker_thread {
@@ -165,6 +169,18 @@ associate_workers_with_ns(void);
 
 static int
 init_worker_ns_ctx(struct worker_ns_ctx *ns_ctx, enum spdk_nvme_qprio qprio);
+
+static void
+submit_init_ios(struct worker_ns_ctx *ns_ctx, int queue_depth);
+
+static void
+submit_single_io(struct worker_ns_ctx *ns_ctx);
+
+static void
+task_complete(void *ctx, const struct spdk_nvme_cpl *completion);
+
+static void
+drain_io(struct worker_ns_ctx *ns_ctx);
 
 // TODO
 
