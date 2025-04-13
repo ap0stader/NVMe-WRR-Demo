@@ -26,6 +26,9 @@ int main(int argc, char **argv) {
 	char task_pool_name[30];
 	uint32_t task_count = 0;
 
+	uint32_t main_core;
+	struct worker_thread *worker, *main_worker;
+
     rc = parse_args(argc, argv);
 	if (rc != 0) {
 		return rc;
@@ -73,6 +76,26 @@ int main(int argc, char **argv) {
 
 	printf("Initialization complete. Launching workers.\n");
 
+	// The worker of the main core should be called by main() function
+	main_core = spdk_env_get_current_core();
+	main_worker = NULL;
+	TAILQ_FOREACH(worker, &g_workers, link) {
+		if (worker->lcore != main_core) {
+			// In register_workers(), one worker was allocated on core
+			spdk_env_thread_launch_pinned(worker->lcore, worker_fn, worker);
+			/* This function starts an environment thread (a thread of OS). Not a SPDK thread. */
+			/* The third argument worker pointer will be the argument of worker_fn. */
+		} else {
+			assert(main_worker == NULL);
+			main_worker = worker;
+		}
+	}
+
+	assert(main_worker != NULL);
+	// Start worker on current core (main core)
+	rc = worker_fn(main_worker);
+
+	spdk_env_thread_wait_all();
 
 	// TODO
 
@@ -83,6 +106,30 @@ exit:
         fprintf(stderr, "%s: errors occurred\n", argv[0]);
     }
     return rc;
+}
+
+static int
+worker_fn(void *arg)
+{	
+	struct worker_thread *worker = (struct worker_thread *)arg;
+	struct worker_ns_ctx *ns_ctx;
+
+	printf("Starting thread on core %u with %s\n", worker->lcore, print_qprio(worker->qprio));
+
+	TAILQ_FOREACH(ns_ctx, &worker->ns_ctx, link) {
+		// Allocate a queue pair for each namespace of this worker with priority
+		if (init_worker_ns_ctx(ns_ctx, worker->qprio) != 0) {
+			printf("ERROR: init_worker_ns_ctx() failed\n");
+			return 1;
+		}
+	}
+
+	TAILQ_FOREACH(ns_ctx, &worker->ns_ctx, link) {
+		// Free the queue pair for each namespace of this worker
+		cleanup_ns_worker_ctx(ns_ctx);
+	}
+
+	return 0;
 }
 
 static int
@@ -514,7 +561,31 @@ associate_workers_with_ns(void)
 	return 0;
 }
 
+static int
+init_worker_ns_ctx(struct worker_ns_ctx *ns_ctx, enum spdk_nvme_qprio qprio)
+{
+	struct spdk_nvme_ctrlr *ctrlr = ns_ctx->ns_entry->nvme.ctrlr;
+	struct spdk_nvme_io_qpair_opts opts;
+
+	spdk_nvme_ctrlr_get_default_io_qpair_opts(ctrlr, &opts, sizeof(opts));
+	opts.qprio = qprio;
+
+	ns_ctx->qpair = spdk_nvme_ctrlr_alloc_io_qpair(ctrlr, &opts, sizeof(opts));
+	if (!ns_ctx->qpair) {
+		printf("ERROR: spdk_nvme_ctrlr_alloc_io_qpair failed\n");
+		return 1;
+	}
+
+	return 0;
+}
+
 // TODO
+
+static void
+cleanup_ns_worker_ctx(struct worker_ns_ctx *ns_ctx)
+{
+	spdk_nvme_ctrlr_free_io_qpair(ns_ctx->qpair);
+}
 
 static void
 cleanup(uint32_t task_count)

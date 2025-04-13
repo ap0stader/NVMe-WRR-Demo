@@ -123,6 +123,9 @@ print_qprio(enum spdk_nvme_qprio qprio)
 }
 
 static int
+worker_fn(void *arg);
+
+static int
 parse_args(int argc, char **argv);
 
 static int
@@ -160,7 +163,13 @@ set_feature_completion(void *cb_arg, const struct spdk_nvme_cpl *cpl);
 static int
 associate_workers_with_ns(void);
 
+static int
+init_worker_ns_ctx(struct worker_ns_ctx *ns_ctx, enum spdk_nvme_qprio qprio);
+
 // TODO
+
+static void
+cleanup_ns_worker_ctx(struct worker_ns_ctx *ns_ctx);
 
 static void
 cleanup(uint32_t task_count);
