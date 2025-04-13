@@ -22,8 +22,9 @@ usage(char *program_name)
 int main(int argc, char **argv) {
     int rc;
     struct spdk_env_opts opts;
-    
-    spdk_nvme_trid_populate_transport(&g_trid, SPDK_NVME_TRANSPORT_PCIE);
+
+	char task_pool_name[30];
+	uint32_t task_count = 0;
 
     rc = parse_args(argc, argv);
 	if (rc != 0) {
@@ -52,11 +53,31 @@ int main(int argc, char **argv) {
 		rc = 1;
 		goto exit;
 	}
+	if (associate_workers_with_ns() != 0) {
+		rc = 1;
+		goto exit;
+	}
+
+	// Create a task pool
+	snprintf(task_pool_name, sizeof(task_pool_name), "task_pool_%d", getpid());
+	task_count = g_arbitration.num_namespaces > g_arbitration.num_workers ?
+				 g_arbitration.num_namespaces : g_arbitration.num_workers;
+	task_count *= g_arbitration.io_queue_depth;
+	g_task_pool = spdk_mempool_create(task_pool_name, task_count,
+					sizeof(struct arb_task), 0, SPDK_ENV_NUMA_ID_ANY);
+	if (g_task_pool == NULL) {
+		fprintf(stderr, "could not initialize task pool\n");
+		rc = 1;
+		goto exit;
+	}
+
+	printf("Initialization complete. Launching workers.\n");
+
 
 	// TODO
 
 exit:
-	cleanup();
+	cleanup(task_count);
     spdk_env_fini();
     if (rc != 0) {
         fprintf(stderr, "%s: errors occurred\n", argv[0]);
@@ -218,7 +239,7 @@ register_controllers(void)
 {
 	printf("Initializing NVMe Controllers\n");
 
-	if (spdk_nvme_probe(&g_trid, NULL, probe_cb, attach_cb, NULL) != 0) {
+	if (spdk_nvme_probe(NULL, NULL, probe_cb, attach_cb, NULL) != 0) {
 		fprintf(stderr, "spdk_nvme_probe() failed\n");
 		return 1;
 	}
@@ -247,7 +268,7 @@ attach_cb(void *cb_ctx, const struct spdk_nvme_transport_id *trid,
 {
 	printf("Attached to %s\n", trid->traddr);
 	// Update with actual arbitration configuration
-	printf("  Weighted Round Robin: %s", opts->arb_mechanism == SPDK_NVME_CC_AMS_WRR ?
+	printf("  Weighted Round Robin: %s\n", opts->arb_mechanism == SPDK_NVME_CC_AMS_WRR ?
 	       "Supported" : "Not Supported");
 	register_ctrlr(ctrlr, opts);
 }
@@ -307,9 +328,9 @@ register_ns(struct spdk_nvme_ctrlr *ctrlr, struct spdk_nvme_ns *ns)
 	// Judge if IO size is valid
 	cdata = spdk_nvme_ctrlr_get_data(ctrlr);
 	// IO size is invalid can because of
-	// 1. Namespace size is too small
-	// 2. Sector size is too smal
-	// 3. IO size is not multiple of Sector size 
+	// 1. The size of namespace size is smaller than IO size
+	// 2. IO size is smaller than sectoer size
+	// 3. IO size is not a multiple of sector size 
 	if (spdk_nvme_ns_get_size(ns) < g_arbitration.io_size_bytes ||
 	    spdk_nvme_ns_get_extended_sector_size(ns) > g_arbitration.io_size_bytes ||
 	    g_arbitration.io_size_bytes % spdk_nvme_ns_get_extended_sector_size(ns)) {
@@ -339,18 +360,32 @@ register_ns(struct spdk_nvme_ctrlr *ctrlr, struct spdk_nvme_ns *ns)
 static void
 print_arb_feature(struct spdk_nvme_ctrlr *ctrlr)
 {
-	get_feature(ctrlr, SPDK_NVME_FEAT_ARBITRATION);
+	int rc;
+	struct spdk_nvme_cmd cmd = {};
 
-	// Get feature is asynchronized. Polling is needed
+	g_features[SPDK_NVME_FEAT_ARBITRATION].valid = false;
+
+	cmd.opc = SPDK_NVME_OPC_GET_FEATURES;
+	cmd.cdw10_bits.get_features.fid = SPDK_NVME_FEAT_ARBITRATION;
+
+	rc = spdk_nvme_ctrlr_cmd_admin_raw(ctrlr, &cmd, NULL, 0, get_feature_completion, &g_features[SPDK_NVME_FEAT_ARBITRATION]);
+	if (rc) {
+		printf("Get Arbitration Feature: Failed 0x%x\n", rc);
+		return;
+	}
+
+	// get_feature() is asynchronized. Polling is needed
 	g_outstanding_commands++;
 	while (g_outstanding_commands) {
 		spdk_nvme_ctrlr_process_admin_completions(ctrlr);
+		/* This function is thread safe */
+		/* This function can be called at any point while the controller is attached to the SPDK NVMe driver. */
 	}
 
-	if (features[SPDK_NVME_FEAT_ARBITRATION].valid) {
+	if (g_features[SPDK_NVME_FEAT_ARBITRATION].valid) {
 		// SPDK designed serveral unions to decode the result automatically
 		union spdk_nvme_cmd_cdw11 arb;
-		arb.feat_arbitration.raw = features[SPDK_NVME_FEAT_ARBITRATION].result;
+		arb.feat_arbitration.raw = g_features[SPDK_NVME_FEAT_ARBITRATION].result;
 
 		printf("Current Arbitration Configuration\n");
 		printf("===========\n");
@@ -364,28 +399,17 @@ print_arb_feature(struct spdk_nvme_ctrlr *ctrlr)
 		printf("Medium Priority Weight:      %u\n", arb.feat_arbitration.bits.mpw + 1);
 		printf("High Priority Weight:        %u\n", arb.feat_arbitration.bits.hpw + 1);
 		printf("\n");
+	} else {
+		printf("Set Arbitration Feature failed\n");
 	}
-}
-
-static int
-get_feature(struct spdk_nvme_ctrlr *ctrlr, uint8_t fid)
-{
-	struct spdk_nvme_cmd cmd = {};
-	struct feature *feature = &features[fid];
-
-	feature->valid = false;
-
-	cmd.opc = SPDK_NVME_OPC_GET_FEATURES;
-	cmd.cdw10_bits.get_features.fid = fid;
-
-	return spdk_nvme_ctrlr_cmd_admin_raw(ctrlr, &cmd, NULL, 0, get_feature_completion, feature);
 }
 
 static void
 get_feature_completion(void *cb_arg, const struct spdk_nvme_cpl *cpl)
 {
-	struct feature *feature = cb_arg;
-	int fid = feature - features;
+	struct feature_entry *feature = cb_arg;
+	// Use the offset of feature entry pointer to calculate fid (feature id)
+	int fid = feature - g_features;
 
 	if (spdk_nvme_cpl_is_error(cpl)) {
 		printf("get_feature(0x%02X) failed\n", fid);
@@ -397,11 +421,13 @@ get_feature_completion(void *cb_arg, const struct spdk_nvme_cpl *cpl)
 	g_outstanding_commands--;
 }
 
-static int
+static void
 set_arb_feature(struct spdk_nvme_ctrlr *ctrlr)
 {
 	int rc;
 	struct spdk_nvme_cmd cmd = {};
+
+	g_features[SPDK_NVME_FEAT_ARBITRATION].valid = false;
 
 	cmd.opc = SPDK_NVME_OPC_SET_FEATURES;
 	cmd.cdw10_bits.set_features.fid = SPDK_NVME_FEAT_ARBITRATION;
@@ -412,10 +438,10 @@ set_arb_feature(struct spdk_nvme_ctrlr *ctrlr)
 	cmd.cdw11_bits.feat_arbitration.bits.lpw = g_arbitration.low_priority_weight;
 
 	rc = spdk_nvme_ctrlr_cmd_admin_raw(ctrlr, &cmd, NULL, 0,
-					    set_feature_completion, &features[SPDK_NVME_FEAT_ARBITRATION]);
+					    set_feature_completion, &g_features[SPDK_NVME_FEAT_ARBITRATION]);
 	if (rc) {
 		printf("Set Arbitration Feature: Failed 0x%x\n", rc);
-		return 1;
+		return;
 	}
 
 	// Polling is also needed
@@ -424,45 +450,86 @@ set_arb_feature(struct spdk_nvme_ctrlr *ctrlr)
 		spdk_nvme_ctrlr_process_admin_completions(ctrlr);
 	}
 
-	if (!features[SPDK_NVME_FEAT_ARBITRATION].valid) {
+	if (!g_features[SPDK_NVME_FEAT_ARBITRATION].valid) {
 		printf("Set Arbitration Feature failed and use default configuration\n");
 	}
-	return 0;
 }
 
 static void
 set_feature_completion(void *cb_arg, const struct spdk_nvme_cpl *cpl)
 {
-	struct feature *feature = cb_arg;
-	// Use the offset of pointer to calculate fid
-	int fid = feature - features;
+	struct feature_entry *feature = cb_arg;
+	int fid = feature - g_features;
 
 	if (spdk_nvme_cpl_is_error(cpl)) {
 		printf("set_feature(0x%02X) failed\n", fid);
-		feature->valid = false;
 	} else {
 		printf("Set Arbitration Feature Successfully\n\n");
+		feature->valid = true;
 	}
 
 	g_outstanding_commands--;
 }
 
-
-
-// TODO be complete
-static void
-cleanup(void)
+static int
+associate_workers_with_ns(void)
 {
-	struct ns_entry *ns_entry, *tmp_ns_entry;
+	struct ns_entry			*ns_entry = TAILQ_FIRST(&g_namespaces);
+	struct worker_thread	*worker = TAILQ_FIRST(&g_workers);
+	struct worker_ns_ctx	*ns_ctx;
+	
+	// The functoin is designed to make every worker or every namespace are being used
+	// In this experiment, the device has only one namespaces, so all the workers are associated to the same namespace
+	int count = g_arbitration.num_namespaces > g_arbitration.num_workers ?
+				g_arbitration.num_namespaces : g_arbitration.num_workers;
+	
+	for (int i = 0; i < count; i++) {
+		if (ns_entry == NULL) {
+			break;
+		}
+
+		// Allocate a context for worker
+		ns_ctx = malloc(sizeof(struct worker_ns_ctx));
+		if (!ns_ctx) {
+			return 1;
+		}
+		memset(ns_ctx, 0, sizeof(*ns_ctx));
+
+		printf("Associating %s Namespace %u with lcore %d\n", ns_entry->name, 
+				spdk_nvme_ns_get_id(ns_entry->nvme.ns), worker->lcore);
+		ns_ctx->ns_entry = ns_entry;
+		TAILQ_INSERT_TAIL(&worker->ns_ctx, ns_ctx, link);
+
+		worker = TAILQ_NEXT(worker, link);
+		if (worker == NULL) {
+			worker = TAILQ_FIRST(&g_workers);
+		}
+
+		ns_entry = TAILQ_NEXT(ns_entry, link);
+		if (ns_entry == NULL) {
+			ns_entry = TAILQ_FIRST(&g_namespaces);
+		}
+	}
+
+	return 0;
+}
+
+// TODO
+
+static void
+cleanup(uint32_t task_count)
+{
 	struct worker_thread *worker, *tmp_worker;
-	struct ns_worker_ctx *ns_ctx, *tmp_ns_ctx;
+	struct worker_ns_ctx *ns_ctx, *tmp_ns_ctx;
+	struct ns_entry *ns_entry, *tmp_ns_entry;
 	struct ctrlr_entry *ctrlr_entry, *tmp_ctrlr_entry;
 	struct spdk_nvme_detach_ctx *detach_ctx = NULL;
 
-	TAILQ_FOREACH_SAFE(ns_entry, &g_namespaces, link, tmp_ns_entry) {
-		TAILQ_REMOVE(&g_namespaces, ns_entry, link);
-		free(ns_entry);
-	};
+	if (spdk_mempool_count(g_task_pool) != (size_t)task_count) {
+		fprintf(stderr, "task_pool count is %zu but should be %u\n", 
+				spdk_mempool_count(g_task_pool), task_count);
+	}
+	spdk_mempool_free(g_task_pool);
 
 	TAILQ_FOREACH_SAFE(worker, &g_workers, link, tmp_worker) {
 		TAILQ_REMOVE(&g_workers, worker, link);
@@ -474,6 +541,11 @@ cleanup(void)
 		}
 
 		free(worker);
+	};
+
+	TAILQ_FOREACH_SAFE(ns_entry, &g_namespaces, link, tmp_ns_entry) {
+		TAILQ_REMOVE(&g_namespaces, ns_entry, link);
+		free(ns_entry);
 	};
 
 	TAILQ_FOREACH_SAFE(ctrlr_entry, &g_controllers, link, tmp_ctrlr_entry) {

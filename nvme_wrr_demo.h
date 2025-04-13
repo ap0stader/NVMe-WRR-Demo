@@ -2,8 +2,10 @@
 #include "spdk/string.h"
 #include "spdk/env.h"
 #include "spdk/nvme.h"
+#include "spdk/event.h"
 
-static struct spdk_nvme_transport_id g_trid = {};
+// outstanding == problems have not yet been resolved
+int	g_outstanding_commands = 0;
 
 struct arb_context {
 	// Specify by options
@@ -36,21 +38,21 @@ static struct arb_context g_arbitration = {
 	.rw_percentage				= 50,
 	.time_in_sec				= 20,
 	.arbitration_burst			= 0x7,
-	.high_priority_weight		= 16,
-	.medium_priority_weight		= 8,
-	.low_priority_weight		= 4,
+	.high_priority_weight		= 16-1, // Weights are 0's based number
+	.medium_priority_weight		= 8-1,
+	.low_priority_weight		= 4-1,
 	// Initial value
 	.num_workers				= 0,
 	.num_namespaces				= 0,
 };
 
 // Use to store the features fetched from controller
-struct feature {
+struct feature_entry {
 	uint32_t				result;
 	bool					valid;
 };
 
-static struct feature features[SPDK_NVME_FEAT_ARBITRATION + 1] = {};
+static struct feature_entry g_features[SPDK_NVME_FEAT_ARBITRATION + 1] = {};
 
 struct ctrlr_entry {
 	struct spdk_nvme_ctrlr		*ctrlr;
@@ -67,27 +69,27 @@ struct ns_entry {
 	} nvme;
 
 	TAILQ_ENTRY(ns_entry)		link;
-	// How many IO of io size can be performed
+	// The size of namespace in io size
 	uint64_t				    size_in_ios;
-	// how many blocks of io size
+	// The amount of blocks of io size
 	uint32_t				    io_size_blocks;
 	char					    name[1024];
 };
 
 static TAILQ_HEAD(, ns_entry) g_namespaces = TAILQ_HEAD_INITIALIZER(g_namespaces);
 
-struct ns_worker_ctx {
-	struct ns_entry				*entry;
-	uint64_t					io_completed;
+struct worker_ns_ctx {
+	struct ns_entry				*ns_entry;
+	TAILQ_ENTRY(worker_ns_ctx)	link;
+	struct spdk_nvme_qpair		*qpair;
 	uint64_t					current_queue_depth;
+	uint64_t					io_completed;
 	uint64_t					offset_in_ios;
 	bool						is_draining;
-	struct spdk_nvme_qpair		*qpair;
-	TAILQ_ENTRY(ns_worker_ctx)	link;
 };
 
 struct worker_thread {
-	TAILQ_HEAD(, ns_worker_ctx)		ns_ctx;
+	TAILQ_HEAD(, worker_ns_ctx)		ns_ctx;
 	TAILQ_ENTRY(worker_thread)		link;
 	// Logical core
 	unsigned						lcore;
@@ -96,9 +98,29 @@ struct worker_thread {
 
 static TAILQ_HEAD(, worker_thread) g_workers = TAILQ_HEAD_INITIALIZER(g_workers);
 
-// outstanding == problems have not yet been resolved
-int	g_outstanding_commands = 0;
+struct arb_task {
+	struct worker_ns_ctx	*ns_ctx;
+	void					*buf;
+};
 
+static struct spdk_mempool *g_task_pool = NULL;
+
+static inline const char *
+print_qprio(enum spdk_nvme_qprio qprio)
+{
+	switch (qprio) {
+	case SPDK_NVME_QPRIO_URGENT:
+		return "urgent priority queue";
+	case SPDK_NVME_QPRIO_HIGH:
+		return "high priority queue";
+	case SPDK_NVME_QPRIO_MEDIUM:
+		return "medium priority queue";
+	case SPDK_NVME_QPRIO_LOW:
+		return "low priority queue";
+	default:
+		return "invalid priority queue";
+	}
+}
 
 static int
 parse_args(int argc, char **argv);
@@ -126,20 +148,19 @@ register_ns(struct spdk_nvme_ctrlr *ctrlr, struct spdk_nvme_ns *ns);
 static void
 print_arb_feature(struct spdk_nvme_ctrlr *ctrlr);
 
-static int
-get_feature(struct spdk_nvme_ctrlr *ctrlr, uint8_t fid);
-
 static void
 get_feature_completion(void *cb_arg, const struct spdk_nvme_cpl *cpl);
 
-static int
+static void
 set_arb_feature(struct spdk_nvme_ctrlr *ctrlr);
 
 static void
 set_feature_completion(void *cb_arg, const struct spdk_nvme_cpl *cpl);
 
+static int
+associate_workers_with_ns(void);
 
-
+// TODO
 
 static void
-cleanup(void);
+cleanup(uint32_t task_count);

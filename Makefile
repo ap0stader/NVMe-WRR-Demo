@@ -11,7 +11,7 @@ APP = nvme_wrr_demo
 
 C_SRCS := nvme_wrr_demo.c
 
-SPDK_LIB_LIST += $(SOCK_MODULES_LIST) nvme vmd
+SPDK_LIB_LIST += $(SOCK_MODULES_LIST) nvme event
 
 include $(SPDK_ROOT_DIR)/mk/spdk.app.mk
 

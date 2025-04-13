@@ -24,6 +24,8 @@ main(int argc, char **argv)
 
 	opts.name = "beginner";
 
+	printf("Initializing SPDK Environment\n");
+
 	// Initialize the SPDK environment
 	if (spdk_env_init(&opts) < 0) {
 		fprintf(stderr, "Unable to initialize SPDK env\n");
@@ -34,8 +36,13 @@ main(int argc, char **argv)
 
 	// Initialize NVMe Transport ID, using PCIe
 	spdk_nvme_trid_populate_transport(&g_trid, SPDK_NVME_TRANSPORT_PCIE);
-	// SPDK NVMe enumeration process, cb == callback
+	/* Also, set the first arguments of spdk_nvme_probe() to NULL is the same */
+	// SPDK NVMe enumeration process
 	rc = spdk_nvme_probe(&g_trid, NULL, probe_cb, attach_cb, NULL);
+	/* cb == callback. The second paramenter is cb_ctx. ctx == context. */
+	/* spdk_nvme_probe() is a synchronized function. */
+	/* It use underlying spdk_nvme_probe_async() and spdk_nvme_probe_poll_async() */
+	
 	// Check if all the preparations are done
 	if (rc != 0) {
 		fprintf(stderr, "spdk_nvme_probe() failed\n");
@@ -68,41 +75,46 @@ nvme_demo(void)
 	int							rc;
 
 	TAILQ_FOREACH(ns_entry, &g_namespaces, link) {
-		// Any I/O qpair allocated for a controller can submit I/O to any namespace on that controller.
+		// Any I/O qpair allocated for a controller can submit I/O to any namespace on that controller
 		ns_entry->qpair = spdk_nvme_ctrlr_alloc_io_qpair(ns_entry->ctrlr, NULL, 0);
 		if (ns_entry->qpair == NULL) {
 			printf("ERROR: spdk_nvme_ctrlr_alloc_io_qpair() failed\n");
 			return;
 		}
 
-		// The device in this experiment does not support CMB (Controller Memory Buffer). Skip trying spdk_nvme_ctrlr_map_cmb().
-
-		// Use spdk_dma_zmalloc to allocate a 4KB zeroed buffer. This memory will be pinned.
 		sequence.ns_entry = ns_entry;
 
+		// The device in this experiment does not support CMB (Controller Memory Buffer). Skip trying spdk_nvme_ctrlr_map_cmb()
 		printf("INFO: using host memory buffer for IO\n");
+
+		// Use spdk_dma_zmalloc() to allocate a 4KB zeroed buffer
+		/* SPDK_MALLOC_DMA flags means the allocated memory will be pinned and safe for DMA */
 		sequence.buf = spdk_zmalloc(0x1000, 0x1000, NULL, SPDK_ENV_NUMA_ID_ANY, SPDK_MALLOC_DMA);
 		snprintf(sequence.buf, 0x1000, "%s", DATA_BUFFER_STRING);
 
 		sequence.is_completed = 0;
 
-		// The active namespace of the device is not a Zoned Namespace. Skip reset_zone_and_wait_for_completion().
+		// The active namespace of the device is not a Zoned Namespace. Skip trying reset_zone_and_wait_for_completion()
 
 		// Write the data buffer to LBA 0 of this namespace
-		// Because of nvme_demo is polling before the write I/O is completed, so passing &sequence (a local variable) is legal.
+		// Because of nvme_demo() is polling before the write I/O is completed, so passing &sequence (a local variable on the stack) is legal
 		rc = spdk_nvme_ns_cmd_write(ns_entry->ns, ns_entry->qpair, sequence.buf,
 					    0, /* LBA start */
 					    1, /* number of LBAs */
 					    write_complete, &sequence, 0);
+		/* &sequence is the argument of callback (cb_arg) function write_complete() */				
 		if (rc != 0) {
 			fprintf(stderr, "starting write I/O failed\n");
 			exit(1);
 		}
+		/* spdk_nvme_ns_cmd_write() is an asynchronized function */
 
 		// Poll for completions
 		// The SPDK NVMe driver will only check for completions when the application calls spdk_nvme_qpair_process_completions().
 		while (!sequence.is_completed) {
 			spdk_nvme_qpair_process_completions(ns_entry->qpair, 0 /* Process all available completions */);
+			/* spdk_nvme_qpair_process_completions() is an asynchronized function. */
+			/* This function may be called at any point while the controller is attached to the SPDK NVMe driver.*/
 		}
 
 		// It is the responsibility of the caller to ensure all pending I/O are completed before trying to free the qpair.
@@ -140,6 +152,8 @@ attach_cb(void *cb_ctx, const struct spdk_nvme_transport_id *trid,
 		exit(1);
 	}
 
+	entry->ctrlr = ctrlr;
+
 	// Use an NVMe admin command to read detailed information on the controller
 	// Specification 5.15.2.2 Identify Controller data structure
 	cdata = spdk_nvme_ctrlr_get_data(ctrlr);
@@ -147,10 +161,9 @@ attach_cb(void *cb_ctx, const struct spdk_nvme_transport_id *trid,
 	snprintf(entry->name, sizeof(entry->name), "%-20.20s (%-20.20s)", cdata->mn, cdata->sn);
 	printf("%s\n", entry->name);
 
-	entry->ctrlr = ctrlr;
 	TAILQ_INSERT_TAIL(&g_controllers, entry, link);
 
-	// In NVMe, namespace IDs start at 1
+	// In NVMe, namespace IDs start at 1. 0 means there are no active namespaces
 	for (nsid = spdk_nvme_ctrlr_get_first_active_ns(ctrlr); nsid != 0;
 	     nsid = spdk_nvme_ctrlr_get_next_active_ns(ctrlr, nsid)) {
 		ns = spdk_nvme_ctrlr_get_ns(ctrlr, nsid);
@@ -222,7 +235,7 @@ read_complete(void *arg, const struct spdk_nvme_cpl *completion)
 {
 	struct nvme_demo_sequence *sequence = arg;
 
-	// Assume the I/O was successful
+	// All I/O operations are completed. So the polling in the main thread can stop.
 	sequence->is_completed = 1;
 
 	if (spdk_nvme_cpl_is_error(completion)) {
