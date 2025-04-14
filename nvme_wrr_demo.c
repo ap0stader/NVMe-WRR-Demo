@@ -578,6 +578,9 @@ associate_workers_with_ns(void)
 		printf("Associating %s Namespace %u with lcore %d\n", ns_entry->name, 
 				spdk_nvme_ns_get_id(ns_entry->nvme.ns), worker->lcore);
 		ns_ctx->ns_entry = ns_entry;
+		ns_ctx->stats.total_tsc = 0;
+		ns_ctx->stats.max_tsc = 0;
+		ns_ctx->stats.min_tsc = UINT64_MAX;
 		TAILQ_INSERT_TAIL(&worker->ns_ctx, ns_ctx, link);
 
 		worker = TAILQ_NEXT(worker, link);
@@ -644,6 +647,8 @@ submit_single_io(struct worker_ns_ctx *ns_ctx)
 	}
 	task->ns_ctx = ns_ctx;
 
+	task->submit_tsc = spdk_get_ticks();
+
 	if (g_arbitration.is_random) {
 		// rand_r() is a thread-safe version random number generator
 		// number range is [0, RAND_MAX] (RAND_MAX == 2147483647 on this machine)
@@ -679,9 +684,19 @@ task_complete(void *ctx, const struct spdk_nvme_cpl *completion)
 {
 	struct arb_task *task = (struct arb_task *)ctx;
 	struct worker_ns_ctx *ns_ctx = task->ns_ctx;
+	uint64_t tsc_diff;
 
 	ns_ctx->current_queue_depth--;
 	ns_ctx->io_completed++;
+
+	tsc_diff = spdk_get_ticks() - task->submit_tsc;
+	ns_ctx->stats.total_tsc += tsc_diff;
+	if (spdk_unlikely(ns_ctx->stats.min_tsc > tsc_diff)) {
+		ns_ctx->stats.min_tsc = tsc_diff;
+	}
+	if (spdk_unlikely(ns_ctx->stats.max_tsc < tsc_diff)) {
+		ns_ctx->stats.max_tsc = tsc_diff;
+	}
 
 	spdk_dma_free(task->buf);
 	spdk_mempool_put(g_task_pool, task);
@@ -707,7 +722,8 @@ print_configuration_and_performance(char *program_name)
 {
 	struct worker_thread	*worker;
 	struct worker_ns_ctx	*ns_ctx;
-	double io_per_second, sent_comparison_io_in_secs;
+	double io_per_second, sent_comparison_io_in_secs, mb_per_second;
+	double average_latency, min_latency, max_latency;
 
 	printf("========================================================\n");
 	printf("Rerun with configuration:\n");
@@ -732,9 +748,15 @@ print_configuration_and_performance(char *program_name)
 		TAILQ_FOREACH(ns_ctx, &worker->ns_ctx, link) {
 			io_per_second = (double)ns_ctx->io_completed / g_arbitration.time_in_sec;
 			sent_comparison_io_in_secs = COMPARISON_IO_COUNT / io_per_second;
-			printf("%-43.43s Namespace %u with core %u: %8.2lf IO/s %8.2lf secs/%d ios\n",
-				   ns_ctx->ns_entry->name, spdk_nvme_ns_get_id(ns_ctx->ns_entry->nvme.ns), worker->lcore,
-				   io_per_second, sent_comparison_io_in_secs, COMPARISON_IO_COUNT);
+			mb_per_second = io_per_second * g_arbitration.io_size_bytes / (1024 * 1024);
+			average_latency = ((double)ns_ctx->stats.total_tsc / ns_ctx->io_completed) * SECOND_TO_MICROSECOND / g_arbitration.tsc_rate;
+  			min_latency = (double)ns_ctx->stats.min_tsc * SECOND_TO_MICROSECOND / g_arbitration.tsc_rate;
+  			max_latency = (double)ns_ctx->stats.max_tsc * SECOND_TO_MICROSECOND / g_arbitration.tsc_rate;
+
+			printf("%-43.43s Namespace %u with core %u: %8.2lf IO/s %8.2lf secs/%d ios %8.2lf MiB/s  ",
+				   ns_ctx->ns_entry->name, spdk_nvme_ns_get_id(ns_ctx->ns_entry->nvme.ns), worker->lcore, io_per_second, sent_comparison_io_in_secs, COMPARISON_IO_COUNT, mb_per_second);
+			printf("Latency average: %8.2f min: %8.2f: max: %8.2f\n",
+				   average_latency, min_latency, max_latency);
 		}
 	}
 	printf("========================================================\n");

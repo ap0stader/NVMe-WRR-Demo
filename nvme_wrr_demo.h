@@ -6,6 +6,8 @@
 
 #define COMPARISON_IO_COUNT 100000
 
+#define SECOND_TO_MICROSECOND 1000000
+
 // outstanding == problems have not yet been resolved
 int	g_outstanding_commands = 0;
 
@@ -41,7 +43,7 @@ static struct arb_context g_arbitration = {
 	.io_pattern_type			= "randrw",
 	.is_random					= 1,
 	.rw_percentage				= 50,
-	.time_in_sec				= 20,
+	.time_in_sec				= 10,
 	.arbitration_burst			= 0x7,
 	.high_priority_weight		= 16, // Weights are 0's based number
 	.medium_priority_weight		= 8,
@@ -96,6 +98,11 @@ struct worker_ns_ctx {
 	bool						is_draining;
 	// Use for statistics
 	uint64_t					io_completed;
+	struct {
+		uint64_t				total_tsc;
+		uint64_t				max_tsc;
+		uint64_t				min_tsc;
+	} stats;
 };
 
 struct worker_thread {
@@ -111,6 +118,7 @@ static TAILQ_HEAD(, worker_thread) g_workers = TAILQ_HEAD_INITIALIZER(g_workers)
 struct arb_task {
 	struct worker_ns_ctx	*ns_ctx;
 	void					*buf;
+	uint64_t				submit_tsc;
 };
 
 static struct spdk_mempool *g_task_pool = NULL;
