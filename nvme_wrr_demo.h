@@ -4,8 +4,12 @@
 #include "spdk/nvme.h"
 #include "spdk/event.h"
 
+#define COMPARISON_IO_COUNT 100000
+
 // outstanding == problems have not yet been resolved
 int	g_outstanding_commands = 0;
+
+static __thread unsigned int random_seed = 0;
 
 struct arb_context {
 	// Specify by options
@@ -20,6 +24,7 @@ struct arb_context {
 	uint32_t		high_priority_weight;
 	uint32_t		medium_priority_weight;
 	uint32_t		low_priority_weight;
+	bool			enable_urgent;
 	// Get by using SPDK
 	uint64_t		tsc_rate;
 	// Other
@@ -30,7 +35,7 @@ struct arb_context {
 static struct arb_context g_arbitration = {
 	// Default value
 	// cores 0-3 for urgent/high/medium/low
-	.core_mask					= "0xf",
+	.core_mask					= "0x7",
 	.io_queue_depth				= 64,
 	.io_size_bytes				= 131072,
 	.io_pattern_type			= "randrw",
@@ -38,9 +43,10 @@ static struct arb_context g_arbitration = {
 	.rw_percentage				= 50,
 	.time_in_sec				= 20,
 	.arbitration_burst			= 0x7,
-	.high_priority_weight		= 16-1, // Weights are 0's based number
-	.medium_priority_weight		= 8-1,
-	.low_priority_weight		= 4-1,
+	.high_priority_weight		= 16, // Weights are 0's based number
+	.medium_priority_weight		= 8,
+	.low_priority_weight		= 4,
+	.enable_urgent				= false,
 	// Initial value
 	.num_workers				= 0,
 	.num_namespaces				= 0,
@@ -182,7 +188,8 @@ task_complete(void *ctx, const struct spdk_nvme_cpl *completion);
 static void
 drain_io(struct worker_ns_ctx *ns_ctx);
 
-// TODO
+static void
+print_configuration_and_performance(char *program_name);
 
 static void
 cleanup_ns_worker_ctx(struct worker_ns_ctx *ns_ctx);

@@ -17,9 +17,11 @@ usage(char *program_name)
 	printf("\t[-h high priority weight, default: 16]\n");
 	printf("\t[-m medium priority weight, default: 8]\n");
 	printf("\t[-l low priority weight, default: 4]\n");
+	printf("\t[-u enable urgent priority queue]\n");
 }
 
-int main(int argc, char **argv) {
+int
+main(int argc, char **argv) {
 	int rc;
 	struct spdk_env_opts opts;
 
@@ -97,8 +99,9 @@ int main(int argc, char **argv) {
 
 	spdk_env_thread_wait_all();
 
-	// TODO
+	print_configuration_and_performance(argv[0]);
 
+	return 0;
 exit:
 	cleanup(task_count);
 	spdk_env_fini();
@@ -165,13 +168,16 @@ parse_args(int argc, char **argv)
 	const char *io_pattern_type = NULL;
 	bool mix_specified = false;
 
-	while ((op = getopt(argc, argv, "b:c:d:h:l:m:p:s:t:M:")) != -1) {
+	while ((op = getopt(argc, argv, "b:c:d:h:l:m:p:s:t:uM:")) != -1) {
 		switch (op) {
 		case 'c':
 			g_arbitration.core_mask = optarg;
 			break;
 		case 'p':
 			g_arbitration.io_pattern_type = optarg;
+			break;
+		case 'u':
+			g_arbitration.enable_urgent = true;
 			break;
 		case '?':
 			usage(argv[0]);
@@ -197,16 +203,19 @@ parse_args(int argc, char **argv)
 				g_arbitration.time_in_sec = val;
 				break;
 			case 'b':
+				if (val >= 7) {
+					printf("The arbitration burst is set to bigger than 7 which means unlimited\n");
+				}
 				g_arbitration.arbitration_burst = val;
 				break;
 			case 'h':
-				g_arbitration.high_priority_weight = val - 1;
+				g_arbitration.high_priority_weight = val;
 				break;
 			case 'm':
-				g_arbitration.medium_priority_weight = val - 1;
+				g_arbitration.medium_priority_weight = val;
 				break;
 			case 'l':
-				g_arbitration.low_priority_weight = val - 1;
+				g_arbitration.low_priority_weight = val;
 				break;
 			default:
 				usage(argv[0]);
@@ -262,10 +271,6 @@ parse_args(int argc, char **argv)
 		}
 	}
 
-	if (g_arbitration.arbitration_burst >= 7) {
-		printf("The arbitration burst is set to bigger than 7 which means unlimited\n");
-	}
-
 	if (g_arbitration.high_priority_weight >= 255 ||
 		g_arbitration.medium_priority_weight >= 255 ||
 		g_arbitration.low_priority_weight >= 255) {
@@ -282,7 +287,7 @@ register_workers(void)
 {
 	uint32_t i;
 	struct worker_thread *worker;
-	enum spdk_nvme_qprio qprio = SPDK_NVME_QPRIO_URGENT;
+	enum spdk_nvme_qprio qprio = SPDK_NVME_QPRIO_HIGH;
 
 	// The environment is initialized with core_mask at main function
 	SPDK_ENV_FOREACH_CORE(i) {
@@ -295,9 +300,12 @@ register_workers(void)
 
 		TAILQ_INIT(&worker->ns_ctx);
 		worker->lcore = i;
-		qprio++;
 		// Mask for more than four cores
-		worker->qprio = qprio & SPDK_NVME_CREATE_IO_SQ_QPRIO_MASK;
+		worker->qprio = qprio;
+		qprio = (qprio + 1) & SPDK_NVME_CREATE_IO_SQ_QPRIO_MASK;
+		if (!g_arbitration.enable_urgent && qprio == SPDK_NVME_QPRIO_URGENT) {
+			qprio++;
+		}
 		
 		TAILQ_INSERT_TAIL(&g_workers, worker, link);
 		g_arbitration.num_workers++;
@@ -461,15 +469,15 @@ print_arb_feature(struct spdk_nvme_ctrlr *ctrlr)
 
 		printf("Current Arbitration Configuration\n");
 		printf("===========\n");
-		printf("Arbitration Burst:		   ");
+		printf("Arbitration Burst:          ");
 		if (arb.feat_arbitration.bits.ab == SPDK_NVME_ARBITRATION_BURST_UNLIMITED) {
 			printf("no limit\n");
 		} else {
 			printf("%u\n", 1u << arb.feat_arbitration.bits.ab);
 		}
-		printf("Low Priority Weight:		 %u\n", arb.feat_arbitration.bits.lpw + 1);
-		printf("Medium Priority Weight:	  %u\n", arb.feat_arbitration.bits.mpw + 1);
-		printf("High Priority Weight:		%u\n", arb.feat_arbitration.bits.hpw + 1);
+		printf("Low Priority Weight:        %u\n", arb.feat_arbitration.bits.lpw + 1);
+		printf("Medium Priority Weight:     %u\n", arb.feat_arbitration.bits.mpw + 1);
+		printf("High Priority Weight:       %u\n", arb.feat_arbitration.bits.hpw + 1);
 		printf("\n");
 	} else {
 		printf("Set Arbitration Feature failed\n");
@@ -505,9 +513,9 @@ set_arb_feature(struct spdk_nvme_ctrlr *ctrlr)
 	cmd.cdw10_bits.set_features.fid = SPDK_NVME_FEAT_ARBITRATION;
 
 	cmd.cdw11_bits.feat_arbitration.bits.ab = g_arbitration.arbitration_burst;
-	cmd.cdw11_bits.feat_arbitration.bits.hpw = g_arbitration.high_priority_weight;
-	cmd.cdw11_bits.feat_arbitration.bits.mpw = g_arbitration.medium_priority_weight;
-	cmd.cdw11_bits.feat_arbitration.bits.lpw = g_arbitration.low_priority_weight;
+	cmd.cdw11_bits.feat_arbitration.bits.hpw = g_arbitration.high_priority_weight - 1;
+	cmd.cdw11_bits.feat_arbitration.bits.mpw = g_arbitration.medium_priority_weight - 1;
+	cmd.cdw11_bits.feat_arbitration.bits.lpw = g_arbitration.low_priority_weight - 1;
 
 	rc = spdk_nvme_ctrlr_cmd_admin_raw(ctrlr, &cmd, NULL, 0,
 						set_feature_completion, &g_features[SPDK_NVME_FEAT_ARBITRATION]);
@@ -612,8 +620,6 @@ submit_init_ios(struct worker_ns_ctx *ns_ctx, int queue_depth)
 	}
 }
 
-static __thread unsigned int seed = 0;
-
 static void
 submit_single_io(struct worker_ns_ctx *ns_ctx)
 {
@@ -641,7 +647,7 @@ submit_single_io(struct worker_ns_ctx *ns_ctx)
 	if (g_arbitration.is_random) {
 		// rand_r() is a thread-safe version random number generator
 		// number range is [0, RAND_MAX] (RAND_MAX == 2147483647 on this machine)
-		offset_in_ios = rand_r(&seed) % ns_entry->size_in_ios;
+		offset_in_ios = rand_r(&random_seed) % ns_entry->size_in_ios;
 	} else {
 		offset_in_ios = ns_ctx->offset_in_ios++;
 		if (ns_ctx->offset_in_ios == ns_entry->size_in_ios) {
@@ -651,7 +657,7 @@ submit_single_io(struct worker_ns_ctx *ns_ctx)
 
 	if ((g_arbitration.rw_percentage == 100) ||
 		(g_arbitration.rw_percentage != 0 &&
-		 ((rand_r(&seed) % 100) < g_arbitration.rw_percentage))) {
+		 ((rand_r(&random_seed) % 100) < g_arbitration.rw_percentage))) {
 		rc = spdk_nvme_ns_cmd_read(ns_entry->nvme.ns, ns_ctx->qpair, task->buf,
 						offset_in_ios * ns_entry->io_size_blocks,
 						ns_entry->io_size_blocks, task_complete, task, 0);
@@ -696,7 +702,43 @@ drain_io(struct worker_ns_ctx *ns_ctx)
 	}
 }
 
-// TODO
+static void
+print_configuration_and_performance(char *program_name)
+{
+	struct worker_thread	*worker;
+	struct worker_ns_ctx	*ns_ctx;
+	double io_per_second, sent_comparison_io_in_secs;
+
+	printf("========================================================\n");
+	printf("Rerun with configuration:\n");
+	printf("sudo %s -d %d -s %d -p %s -M %d -c %s -t %d -b %d -h %d -m %d -l %d",
+	       program_name,
+	       g_arbitration.io_queue_depth,
+	       g_arbitration.io_size_bytes,
+	       g_arbitration.io_pattern_type,
+	       g_arbitration.rw_percentage,
+	       g_arbitration.core_mask,
+	       g_arbitration.time_in_sec,
+	       g_arbitration.arbitration_burst,
+	       g_arbitration.high_priority_weight,
+	       g_arbitration.medium_priority_weight,
+	       g_arbitration.low_priority_weight);
+	printf(g_arbitration.enable_urgent ? " -u" : "");
+	printf("\n");
+
+	printf("========================================================\n");
+
+	TAILQ_FOREACH(worker, &g_workers, link) {
+		TAILQ_FOREACH(ns_ctx, &worker->ns_ctx, link) {
+			io_per_second = (double)ns_ctx->io_completed / g_arbitration.time_in_sec;
+			sent_comparison_io_in_secs = COMPARISON_IO_COUNT / io_per_second;
+			printf("%-43.43s Namespace %u with core %u: %8.2lf IO/s %8.2lf secs/%d ios\n",
+				   ns_ctx->ns_entry->name, spdk_nvme_ns_get_id(ns_ctx->ns_entry->nvme.ns), worker->lcore,
+				   io_per_second, sent_comparison_io_in_secs, COMPARISON_IO_COUNT);
+		}
+	}
+	printf("========================================================\n");
+}
 
 static void
 cleanup_ns_worker_ctx(struct worker_ns_ctx *ns_ctx)
